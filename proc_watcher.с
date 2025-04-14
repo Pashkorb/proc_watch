@@ -1,0 +1,185 @@
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/slab.h>
+#include <linux/sched.h>
+#include <trace/events/sched.h>
+
+static DEFINE_SPINLOCK(watch_lock);
+static size_t head=0;
+static size_t tail=0;
+static struct kobject *watch_kobj;
+static char *buffer;
+static bool pause;
+static pid_t pid_filter = 0;
+
+#define LOG_LINE_MAX 256
+#define BUF_SIZE 4096
+
+static ssize_t pid_filter_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+	spin_lock(&watch_lock);
+	int len=snprintf(buf,"%d\n",pid_filter);
+	spin_unlock(&watch_lock);
+	return len;
+}
+
+static ssize_t pid_filter_store(struct kobject *kobj, struct kobj_attribute *attr,
+                            const char *buf, size_t count){
+	spin_lock(&watch_lock);
+	
+	long pid_long;
+	if (kstrtol(buf, 10, &pid_long) != 0) {
+		spin_unlock(&watch_lock);
+		return -EINVAL;
+	}
+
+	pid_filter = (pid_t)pid_long;
+	spin_unlock(&watch_lock);
+	return count;
+
+}
+static struct kobj_attribute pid_filter_attr = __ATTR(pid_filter, 0664, pid_filter_show, pid_filter_store);
+
+
+static ssize_t buffer_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+	spin_lock(&watch_lock);
+    	size_t i = tail;
+    	size_t out_pos = 0;
+
+	while (i != head && out_pos < (PAGE_SIZE - 1)) {
+		buf[out_pos++] = buffer[i];
+		i = (i + 1) % BUF_SIZE;
+	}	
+	
+	spin_unlock(&watch_lock);
+	return out_pos;
+
+}
+
+static ssize_t buffer_store(struct kobject *kobj, struct kobj_attribute *attr,
+                            const char *buf, size_t count)
+{
+	spin_lock(&watch_lock);
+
+	if (strncmp(buf, "clear", 5) == 0) {
+		head = 0;
+		tail = 0;
+		spin_unlock(&watch_lock);
+		pr_info("proc_watch: buffer cleared by user\n");
+		return count;
+	}
+
+	if (strncmp(buf, "pause", 5) == 0) {
+		WRITE_ONCE(pause, true);;
+		spin_unlock(&watch_lock);
+		return count;
+	}
+
+	if (strncmp(buf, "resume", 6) == 0) {
+		WRITE_ONCE(pause, false);;
+		spin_unlock(&watch_lock);
+		return count;
+	}
+
+	spin_unlock(&watch_lock);
+	pr_info("proc_watch: unknown command '%.*s'\n", (int)count, buf);
+	return -EINVAL;
+}
+
+static struct kobj_attribute static_attr = __ATTR(buffer,0664,buffer_show, buffer_store);
+static struct attribute *watch_attrs[] = {
+	&static_attr.attr,
+	&pid_filter_attr.attr,
+	NULL
+};
+
+static struct attribute_group watch_group = {
+	.attrs = watch_attrs,
+};
+
+static void fork_event_handler(void *data, struct task_struct *parent, struct task_struct *child) {
+	spin_lock(&watch_lock);
+
+	if (pause){
+		spin_unlock(&watch_lock);
+		return;
+	}
+	if (READ_ONCE(pid_filter) != 0 && parent->pid != READ_ONCE(pid_filter))
+		return;
+	size_t used = (head >= tail) ? (head - tail) : (BUF_SIZE - tail + head);
+	size_t free = BUF_SIZE - used;
+
+	char new_buffer[LOG_LINE_MAX];
+	int len = snprintf(new_buffer, LOG_LINE_MAX,
+   		"FORK: parent='%s' (PID=%d), child='%s' (PID=%d)\n",
+   		parent->comm, task_pid_nr(parent), child->comm, task_pid_nr(child));
+
+	if(unlikely(len>=BUF_SIZE)){
+		new_buffer+=(len - BUF_SIZE +1);
+		len=BUF_SIZE;
+	} 	
+
+	while (free <= len) {
+		tail = (tail + 1) % BUF_SIZE;
+		free++;
+	}	
+
+	if(head+len>BUF_SIZE){
+		size_t first_part = BUF_SIZE - head;
+		memcpy(buffer+head, new_buffer, first_part);
+		memcpy(buffer,new_buffer, len-first_part);
+		head = (head + len) % BUF_SIZE;
+	}else {
+        memcpy(buffer + head, new_buffer, len);
+        head += len;
+    	}
+
+	printk(KERN_INFO "%s", new_buffer);
+	spin_unlock(&watch_lock);
+	
+}
+
+static int __init proc_watch_init(void) {
+	int ret;
+
+	buffer = kmalloc(BUF_SIZE, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+
+	watch_kobj = kobject_create_and_add("proc_watch", kernel_kobj);
+	if (!watch_kobj) {
+		kfree(buffer);
+		return -ENOMEM;
+	}
+
+	ret = sysfs_create_group(watch_kobj, &watch_group);
+	if (ret) {
+		kobject_put(watch_kobj);
+		kfree(buffer);
+		return ret;
+	}
+
+	ret = register_trace_sched_process_fork(fork_event_handler, NULL);
+	if (ret) {
+		sysfs_remove_group(watch_kobj, &watch_group);
+		kobject_put(watch_kobj);
+		kfree(buffer);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void __exit proc_watch_exit(void) {
+	unregister_trace_sched_process_fork(fork_event_handler, NULL);
+	sysfs_remove_group(watch_kobj, &watch_group);
+	kobject_put(watch_kobj);
+	kfree(buffer);
+}
+
+module_init(proc_watch_init);
+module_exit(proc_watch_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Korban Pavel");
